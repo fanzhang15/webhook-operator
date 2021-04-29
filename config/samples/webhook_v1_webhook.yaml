@@ -1,7 +1,6 @@
 apiVersion: webhook.example.com/v1
 kind: WebHook
 metadata:
-  name: webhook-sample
+  name: audit-webhook
 spec:
-  # Add fields here
-  foo: bar
+  size: 1
