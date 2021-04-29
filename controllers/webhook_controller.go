@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -51,6 +52,7 @@ const (
 	MEM_REQUEST = "100Mi"
 	// 单个POD的内存资源上限
 	MEM_LIMIT = "200Mi"
+
 )
 
 
@@ -69,7 +71,8 @@ type WebHookReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations,verbs=get;list;watch;create;update;patch;delete
 
 func (r *WebHookReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("webhook", req.NamespacedName)
@@ -152,6 +155,19 @@ func (r *WebHookReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				// 返回错误信息给外部
 				return ctrl.Result{}, err
 			}
+
+
+			// deployment创建后立即创建MutatingWebhookConfiguration
+			if err = createMutatingWebhookConfigurationIfNotExists(ctx, r, instance, req); err != nil {
+				log.Error(err, "5.5 error")
+				// 返回错误信息给外部
+				return ctrl.Result{}, err
+			}
+
+
+
+
+
 
 			// 创建成功就可以返回了
 			return ctrl.Result{}, nil
@@ -244,7 +260,7 @@ func createServiceIfNotExists(ctx context.Context, r *WebHookReconciler, webHook
 	}
 
 	// 这一步非常关键！
-	// 建立关联后，删除elasticweb资源时就会将service也删除掉
+	// 建立关联后，删除webhook资源时就会将service也删除掉
 	log.Info("set reference")
 	if err := controllerutil.SetControllerReference(webHook, service, r.Scheme); err != nil {
 		log.Error(err, "SetControllerReference error")
@@ -506,6 +522,102 @@ func updateStatus(ctx context.Context, r *WebHookReconciler, webHook *webhookv1.
 }
 
 
+// 新建MutatingWebhookConfiguration
+func createMutatingWebhookConfigurationIfNotExists(ctx context.Context, r *WebHookReconciler, webHook *webhookv1.WebHook, req ctrl.Request) error {
+	log := r.Log.WithValues("func", "MutatingWebhookConfiguration")
+
+	mc := &admissionregistrationv1beta1.MutatingWebhookConfiguration{}
+
+	err := r.Get(ctx, req.NamespacedName, mc)
+
+	path := "/add-sidecar"
+
+	
+	failurePolicy := new(admissionregistrationv1beta1.FailurePolicyType)
+	*failurePolicy  = admissionregistrationv1beta1.Ignore
+
+	
+	matchPolicy  := new(admissionregistrationv1beta1.MatchPolicyType)
+	*matchPolicy =  admissionregistrationv1beta1.Equivalent
+
+	scope  := new(admissionregistrationv1beta1.ScopeType)
+	*scope = admissionregistrationv1beta1.NamespacedScope
+
+
+	// 如果查询结果没有错误，证明mc正常，就不做任何操作
+	if err == nil {
+		log.Info("MutatingWebhookConfiguration exists")
+		return nil
+	}
+
+	// 如果错误不是NotFound，就返回错误
+	if !errors.IsNotFound(err) {
+		log.Error(err, "query MutatingWebhookConfiguration error")
+		return err
+	}
+
+	// 实例化一个数据结构
+	mc = &admissionregistrationv1beta1.MutatingWebhookConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: webHook.Namespace,
+			Name:      "audit-webhook-config",
+		},
+		Webhooks: []admissionregistrationv1beta1.MutatingWebhook{{
+			Name:      "audit.watson.org",
+			MatchPolicy: matchPolicy,
+			ObjectSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"cp4d-audit": "yes",
+				},
+			},
+			Rules: []admissionregistrationv1beta1.RuleWithOperations{{
+				Operations: []admissionregistrationv1beta1.OperationType{admissionregistrationv1beta1.Create},
+				Rule: admissionregistrationv1beta1.Rule{
+					APIGroups: []string{""},
+					APIVersions: []string{"v1"},
+					Resources: []string{"pods"},
+					Scope: scope,
+				},
+			},
+			},
+			ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
+				Service: &admissionregistrationv1beta1.ServiceReference{
+					Name: "audit-webhook-service",
+					Namespace: "default",
+					Path: &path,
+					Port: pointer.Int32Ptr(443),
+				},
+				CABundle: stringtoslicebyte("LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUQ3ekNDQXRjQ0ZCTlM0bXQ2bmt0SWpZZmtnYjA5Y2lFbjVPbEZNQTBHQ1NxR1NJYjNEUUVCRFFVQU1JR3oKTVFzd0NRWURWUVFHRXdKVlV6RUxNQWtHQTFVRUNBd0NUbGt4RURBT0JnTlZCQWNNQjBOdmJHOW5ibVV4RHpBTgpCZ05WQkJFTUJqUXlOREkwTWpFVU1CSUdBMVVFQ1F3TFNHRnNiRzhnSURFMk1qRXhEREFLQmdOVkJBb01BMGxDClRURVBNQTBHQTFVRUN3d0dWMkYwYzI5dU1STXdFUVlEVlFRRERBcDNZWFJ6YjI0dWIzSm5NU293S0FZSktvWkkKaHZjTkFRa0JGaHRvWVhKcGJtRnlZWGxoYm1GdUxtMXZhR0Z1UUdsaWJTNWpiMjB3SGhjTk1qQXdPVEk0TVRrMQpOalU0V2hjTk1qQXhNREk0TVRrMU5qVTRXakNCc3pFTE1Ba0dBMVVFQmhNQ1ZWTXhDekFKQmdOVkJBZ01BazVaCk1SQXdEZ1lEVlFRSERBZERiMnh2WjI1bE1ROHdEUVlEVlFRUkRBWTBNalF5TkRJeEZEQVNCZ05WQkFrTUMwaGgKYkd4dklDQXhOakl4TVF3d0NnWURWUVFLREFOSlFrMHhEekFOQmdOVkJBc01CbGRoZEhOdmJqRVRNQkVHQTFVRQpBd3dLZDJGMGMyOXVMbTl5WnpFcU1DZ0dDU3FHU0liM0RRRUpBUlliYUdGeWFXNWhjbUY1WVc1aGJpNXRiMmhoCmJrQnBZbTB1WTI5dE1JSUJJakFOQmdrcWhraUc5dzBCQVFFRkFBT0NBUThBTUlJQkNnS0NBUUVBM2huSzltUkkKdTByT2pOZDhjOWlZaVI3dXArNWY5NVBGaEhLcTNlR1JTbWhqbWNOaVBhTjJHMEFLWUZkZEtXajh0YkNlbGg3ZwpDaVZpcFU3c2lEazMzRkRnWFFad0xrS2hMTThDWlllSm9TWmd3RUFUemZnWkltNHhxdWwrcmRHSXJIRkdOTW1KCjFlb1hCcEdEVks0NDR5SUhhdUx3elR4c3Q2MWZzdzlCeVR5M2N1UndFdC9DUkcvWE5ibVJ0Wi9HSm40dHJGcFQKMVpsYlRtVysvT08vS0R4UEZVcmJrQzNhNjB0NlZhNHJnckIrR0FxbTRLbmMvUmpYTy9EMEZuejE1bUFrNGtUeApaTjJDUEVpQWRpYytORE5GVW1Ra0IyajBqZjhraHNwQVVUdFdUS3REd1ZveStjS0p4bTl5MklJTmtMM3RJRzNJCis3VW1YakhiQXRZS1RRSURBUUFCTUEwR0NTcUdTSWIzRFFFQkRRVUFBNElCQVFETmJoQ0Nob25YVURpZWRIR0oKbXNzZWJPWE9WYUpCTUhxc2NrVGowaisyMFRPS211c2xZU1hMTTJaSGpPNmNvdTB3Z1VZZ0VYZjBZRTJSdWRVdQpOQkZBMWRFcWVVV2FIZUxFeUwxS1AxWU1SWnlWWG9WOUZVMnBpS0hjK1hJSkVqSnB6ajg3Mm9PTmh4MHVpcUpZCkQ2eUVnWTJqVlZsWXdCWGE1K1JOdU1ROVJXemRkS1I2VzlSZExhdWdxbUJ6b2poYkx2MmJzVUJNSDE0SVZ4blMKSkFZYnh2NkdINmFzWXNPRkQySmRyMVI1MkJhZFNTaGxZd0lNb3NTTmNQQzIwajdZQjMxSmZOYitCU0trSEpSawpWZUYzWUk3YmtoaXBqajZhSncrZFJXckZaRVpjTXRNNm0xYlpvQ1JWWUhIcmUrbUxZVDhSaTF4bUVXaHpsMnZyCjlvTTYKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo="),
+			},
+			FailurePolicy: failurePolicy,
+
+		},
+		},
+	}
+
+	// 这一步非常关键！
+	// 建立关联后，删除webhook资源时就会将service也删除掉
+	log.Info("set reference")
+	if err := controllerutil.SetControllerReference(webHook, mc, r.Scheme); err != nil {
+		log.Error(err, "SetControllerReference error")
+		return err
+	}
+
+	// 创建MutatingWebhookConfiguration
+	log.Info("start create MutatingWebhookConfiguration")
+	if err := r.Create(ctx, mc); err != nil {
+		log.Error(err, "create MutatingWebhookConfiguration error")
+		return err
+	}
+
+	log.Info("create MutatingWebhookConfiguration success")
+
+	return nil
+}
+
+
+
+
 
 
 
@@ -531,3 +643,4 @@ func getPodNames(pods []corev1.Pod) []string {
 	}
 	return podNames
 }
+
